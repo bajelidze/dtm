@@ -1,5 +1,6 @@
 use std::ffi::CStr;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::pty::{self, Winsize};
 use nix::unistd::{self, Pid};
 
@@ -18,6 +19,10 @@ impl Pty {
                     unreachable!()
                 }
                 pty::ForkptyResult::Parent { child, master } => {
+                    let flags = OFlag::from_bits_truncate(
+                        fcntl(&master, FcntlArg::F_GETFL)?
+                    );
+                    fcntl(&master, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
                     Ok(Self { master, child })
                 }
             }
