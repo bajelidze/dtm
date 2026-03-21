@@ -61,6 +61,72 @@ impl Mux {
         forward
     }
 
+    fn handle_resize(&mut self, stdin_fd: BorrowedFd) {
+        let ws = get_winsize(stdin_fd);
+        for pane in self.panes.values_mut() {
+            pane.resize(ws.ws_row, ws.ws_col);
+        }
+    }
+
+    /// Read output from ready panes and handle dead panes.
+    /// Returns true if all panes are dead (caller should exit).
+    fn read_panes(&mut self, ready_keys: &[(usize, RawFd)], stdout_fd: BorrowedFd) -> bool {
+        let mut dead = Vec::new();
+        for &(key, _) in ready_keys {
+            if let Some(pane) = self.panes.get_mut(&key) {
+                let mut buf = [0u8; 4096];
+                match unistd::read(pane.pty().master_fd(), &mut buf) {
+                    Ok(0) | Err(_) => dead.push(key),
+                    Ok(n) => {
+                        let was_alt = pane.term().mode().contains(TermMode::ALT_SCREEN);
+                        pane.process(&buf[..n]);
+                        let is_alt = pane.term().mode().contains(TermMode::ALT_SCREEN);
+
+                        if key == self.active {
+                            if was_alt != is_alt {
+                                pane.render(stdout_fd);
+                            } else {
+                                let _ = unistd::write(stdout_fd, &buf[..n]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for key in &dead {
+            self.panes.remove(key);
+        }
+        if self.panes.is_empty() {
+            return true;
+        }
+        if !self.panes.contains_key(&self.active) {
+            self.active = *self.panes.keys().next().unwrap();
+            if let Some(pane) = self.panes.get(&self.active) {
+                pane.render(stdout_fd);
+            }
+        }
+        false
+    }
+
+    /// Read from stdin, process keybinds, forward to active pane.
+    /// Returns true if stdin is closed (caller should exit).
+    fn read_stdin(&mut self, stdin_fd: BorrowedFd, stdout_fd: BorrowedFd) -> bool {
+        let mut buf = [0u8; 4096];
+        match unistd::read(stdin_fd, &mut buf) {
+            Ok(0) | Err(_) => true,
+            Ok(n) => {
+                let forward = self.process_stdin(&buf[..n], stdin_fd, stdout_fd);
+                if !forward.is_empty() {
+                    if let Some(pane) = self.panes.get(&self.active) {
+                        let _ = unistd::write(pane.pty().master_fd(), &forward);
+                    }
+                }
+                false
+            }
+        }
+    }
+
     pub fn run(&mut self, stdin_fd: BorrowedFd, stdout_fd: BorrowedFd) {
         let stdin_raw: RawFd = stdin_fd.as_raw_fd();
 
@@ -80,10 +146,7 @@ impl Mux {
             match select::select(None, &mut read_fds, None, None, None) {
                 Err(Errno::EINTR) => {
                     if SIGWINCH_RECEIVED.swap(false, Ordering::Relaxed) {
-                        let ws = get_winsize(stdin_fd);
-                        for pane in self.panes.values_mut() {
-                            pane.resize(ws.ws_row, ws.ws_col);
-                        }
+                        self.handle_resize(stdin_fd);
                     }
                     continue;
                 }
@@ -97,56 +160,11 @@ impl Mux {
                 .copied()
                 .collect();
 
-            // Read output from ready panes.
-            let mut dead = Vec::new();
-            for (key, _) in &ready_keys {
-                if let Some(pane) = self.panes.get_mut(key) {
-                    let mut buf = [0u8; 4096];
-                    match unistd::read(pane.pty().master_fd(), &mut buf) {
-                        Ok(0) | Err(_) => dead.push(*key),
-                        Ok(n) => {
-                            let was_alt = pane.term().mode().contains(TermMode::ALT_SCREEN);
-                            pane.process(&buf[..n]);
-                            let is_alt = pane.term().mode().contains(TermMode::ALT_SCREEN);
-
-                            if *key == self.active {
-                                if was_alt != is_alt {
-                                    pane.render(stdout_fd);
-                                } else {
-                                    let _ = unistd::write(stdout_fd, &buf[..n]);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            for key in &dead {
-                self.panes.remove(key);
-            }
-            if self.panes.is_empty() {
+            if self.read_panes(&ready_keys, stdout_fd) {
                 return;
             }
-            if !self.panes.contains_key(&self.active) {
-                self.active = *self.panes.keys().next().unwrap();
-                if let Some(pane) = self.panes.get(&self.active) {
-                    pane.render(stdout_fd);
-                }
-            }
-
-            if stdin_ready {
-                let mut buf = [0u8; 4096];
-                match unistd::read(stdin_fd, &mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let forward = self.process_stdin(&buf[..n], stdin_fd, stdout_fd);
-                        if !forward.is_empty() {
-                            if let Some(pane) = self.panes.get(&self.active) {
-                                let _ = unistd::write(pane.pty().master_fd(), &forward);
-                            }
-                        }
-                    }
-                }
+            if stdin_ready && self.read_stdin(stdin_fd, stdout_fd) {
+                break;
             }
         }
     }
