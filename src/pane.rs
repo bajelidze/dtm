@@ -4,7 +4,7 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::{Config, LineDamageBounds, Term, TermDamage, TermMode};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor};
+use alacritty_terminal::vte::ansi::{Color, CursorShape, CursorStyle, NamedColor, Processor};
 use nix::unistd;
 
 use crate::pty::Pty;
@@ -142,6 +142,7 @@ impl Pane {
             buf.extend_from_slice(b"\x1B[?25l");
         } else {
             buf.extend_from_slice(b"\x1B[?25h");
+            write_cursor_shape(&mut buf, self.term.cursor_style());
         }
 
         let _ = unistd::write(stdout_fd, &buf);
@@ -202,12 +203,23 @@ impl Pane {
         );
         if self.term.mode().contains(TermMode::SHOW_CURSOR) {
             buf.extend_from_slice(b"\x1B[?25h");
+            write_cursor_shape(&mut buf, self.term.cursor_style());
         } else {
             buf.extend_from_slice(b"\x1B[?25l");
         }
 
         let _ = unistd::write(stdout_fd, &buf);
     }
+}
+
+fn write_cursor_shape(buf: &mut Vec<u8>, style: CursorStyle) {
+    let n = match style.shape {
+        CursorShape::Block | CursorShape::HollowBlock => if style.blinking { 1 } else { 2 },
+        CursorShape::Underline => if style.blinking { 3 } else { 4 },
+        CursorShape::Beam => if style.blinking { 5 } else { 6 },
+        CursorShape::Hidden => return,
+    };
+    buf.extend_from_slice(format!("\x1B[{} q", n).as_bytes());
 }
 
 struct SgrState {
