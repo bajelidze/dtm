@@ -1,3 +1,4 @@
+mod keybinds;
 mod mux;
 mod pane;
 mod pty;
@@ -71,6 +72,13 @@ fn resolve_shell() -> CString {
 }
 
 fn main() -> io::Result<()> {
+    if std::env::var_os("DTM").is_some() {
+        eprintln!("dtm sessions cannot be nested");
+        std::process::exit(1);
+    }
+    // Safe: single-threaded, called before spawning any child processes.
+    unsafe { std::env::set_var("DTM", "1"); }
+
     let stdin = io::stdin();
     let stdout = io::stdout();
 

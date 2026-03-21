@@ -6,17 +6,16 @@ use nix::errno::Errno;
 use nix::sys::select;
 use nix::unistd;
 use alacritty_terminal::term::TermMode;
+use crate::keybinds::{Action, Keybinds};
 use crate::pane::Pane;
 use crate::pty::Pty;
 use crate::SIGWINCH_RECEIVED;
 use crate::get_winsize;
 
-const ESC: u8 = 0x1B;
-
 pub struct Mux {
     panes: BTreeMap<usize, Pane>,
     active: usize,
-    pending_esc: bool,
+    keybinds: Keybinds,
     shell: CString,
 }
 
@@ -24,7 +23,7 @@ impl Mux {
     pub fn new(initial: Pane, shell: CString) -> Self {
         let mut panes = BTreeMap::new();
         panes.insert(1, initial);
-        Self { panes, active: 1, pending_esc: false, shell }
+        Self { panes, active: 1, keybinds: Keybinds::new(), shell }
     }
 
     fn handle_tab(&mut self, tab_num: usize, stdin_fd: BorrowedFd, stdout_fd: BorrowedFd) {
@@ -48,43 +47,17 @@ impl Mux {
         }
     }
 
-    /// Process stdin bytes, intercepting Alt+digit sequences.
-    fn process_stdin(&mut self, buf: &[u8], stdin_fd: BorrowedFd, stdout_fd: BorrowedFd) -> Vec<u8> {
-        let mut forward = Vec::new();
-        let mut i = 0;
-
-        while i < buf.len() {
-            if self.pending_esc {
-                self.pending_esc = false;
-                if buf[i] >= b'1' && buf[i] <= b'9' {
-                    let tab_num = (buf[i] - b'0') as usize;
-                    self.handle_tab(tab_num, stdin_fd, stdout_fd);
-                    i += 1;
-                    continue;
-                }
-                forward.push(ESC);
-            }
-
-            if buf[i] == ESC {
-                if i + 1 < buf.len() {
-                    if buf[i + 1] >= b'1' && buf[i + 1] <= b'9' {
-                        let tab_num = (buf[i + 1] - b'0') as usize;
-                        self.handle_tab(tab_num, stdin_fd, stdout_fd);
-                        i += 2;
-                        continue;
-                    }
-                    forward.push(buf[i]);
-                    i += 1;
-                } else {
-                    self.pending_esc = true;
-                    i += 1;
-                }
-            } else {
-                forward.push(buf[i]);
-                i += 1;
-            }
+    fn dispatch(&mut self, action: Action, stdin_fd: BorrowedFd, stdout_fd: BorrowedFd) {
+        match action {
+            Action::SwitchTab(tab_num) => self.handle_tab(tab_num, stdin_fd, stdout_fd),
         }
+    }
 
+    fn process_stdin(&mut self, buf: &[u8], stdin_fd: BorrowedFd, stdout_fd: BorrowedFd) -> Vec<u8> {
+        let (actions, forward) = self.keybinds.feed(buf);
+        for action in actions {
+            self.dispatch(action, stdin_fd, stdout_fd);
+        }
         forward
     }
 
