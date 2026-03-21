@@ -54,8 +54,13 @@ fn main() -> io::Result<()> {
 
     let orig_termios = enter_raw_mode(stdin.as_fd());
 
+    // Enter alternate screen buffer and clear it.
+    let _ = nix::unistd::write(stdout.as_fd(), b"\x1B[?1049h\x1B[2J\x1B[H");
+
     mux.run(stdin.as_fd(), stdout.as_fd());
 
+    // Leave alternate screen buffer (restores original content) and show cursor.
+    let _ = nix::unistd::write(stdout.as_fd(), b"\x1B[?1049l\x1B[?25h");
     let _ = termios::tcsetattr(stdin.as_fd(), termios::SetArg::TCSANOW, &orig_termios);
 
     Ok(())

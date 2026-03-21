@@ -5,6 +5,7 @@ use nix::errno::Errno;
 use nix::sys::select;
 use nix::unistd;
 use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor};
 use crate::pane::Pane;
@@ -69,11 +70,12 @@ impl Mux {
             let point = indexed.point;
             let cell = indexed.cell;
 
-            // Move to new line if needed.
+            // Move cursor to start of new line if needed.
             if prev_line != Some(point.line.0) {
-                if let Some(_) = prev_line {
-                    buf.extend_from_slice(b"\r\n");
-                }
+                // Use absolute positioning: \x1B[row;1H (1-based).
+                buf.extend_from_slice(
+                    format!("\x1B[{};1H", point.line.0 + 1).as_bytes()
+                );
                 prev_line = Some(point.line.0);
             }
 
@@ -234,9 +236,19 @@ impl Mux {
                     match unistd::read(pane.pty().master_fd(), &mut buf) {
                         Ok(0) | Err(_) => dead.push(*key),
                         Ok(n) => {
+                            let was_alt = pane.term().mode().contains(TermMode::ALT_SCREEN);
                             pane.process(&buf[..n]);
+                            let is_alt = pane.term().mode().contains(TermMode::ALT_SCREEN);
+
                             if *key == self.active {
-                                let _ = unistd::write(stdout_fd, &buf[..n]);
+                                if was_alt != is_alt {
+                                    // Alt screen toggled — re-render from grid
+                                    // instead of passing raw bytes (which would
+                                    // corrupt the real terminal's alt screen state).
+                                    Self::render_pane(pane, stdout_fd);
+                                } else {
+                                    let _ = unistd::write(stdout_fd, &buf[..n]);
+                                }
                             }
                         }
                     }
