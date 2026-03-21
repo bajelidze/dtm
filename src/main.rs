@@ -2,12 +2,14 @@ mod mux;
 mod pane;
 mod pty;
 
+use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use nix::pty::Winsize;
 use nix::sys::signal;
 use nix::sys::termios;
+use nix::unistd;
 
 static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
 
@@ -35,14 +37,48 @@ fn enter_raw_mode(fd: BorrowedFd) -> termios::Termios {
     orig
 }
 
+/// Check if a shell path is valid: absolute path and executable.
+fn check_shell(shell: &str) -> bool {
+    shell.starts_with('/')
+        && nix::unistd::access(shell, nix::unistd::AccessFlags::X_OK).is_ok()
+}
+
+/// Resolve the user's shell.
+/// $SHELL → getpwuid() → /bin/sh
+fn resolve_shell() -> CString {
+    // 1. $SHELL environment variable.
+    if let Ok(shell) = std::env::var("SHELL") {
+        if check_shell(&shell) {
+            return CString::new(shell).unwrap();
+        }
+    }
+
+    // 2. passwd entry for current user.
+    if let Some(pw_shell) = unistd::User::from_uid(unistd::getuid())
+        .ok()
+        .flatten()
+        .map(|u| u.shell)
+    {
+        if let Some(s) = pw_shell.to_str() {
+            if check_shell(s) {
+                return CString::new(s).unwrap();
+            }
+        }
+    }
+
+    // 3. Fallback.
+    CString::new("/bin/sh").unwrap()
+}
+
 fn main() -> io::Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
 
+    let shell = resolve_shell();
     let winsize = get_winsize(stdin.as_fd());
-    let initial_pty = pty::Pty::spawn(&winsize, c"bash").unwrap();
+    let initial_pty = pty::Pty::spawn(&winsize, &shell).unwrap();
     let initial_pane = pane::Pane::new(initial_pty, winsize.ws_row, winsize.ws_col);
-    let mut mux = mux::Mux::new(initial_pane);
+    let mut mux = mux::Mux::new(initial_pane, shell);
 
     // Install SIGWINCH handler.
     let sa = signal::SigAction::new(

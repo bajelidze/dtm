@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ffi::CString;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::sync::atomic::Ordering;
 use nix::errno::Errno;
@@ -19,13 +20,14 @@ pub struct Mux {
     panes: BTreeMap<usize, Pane>,
     active: usize,
     pending_esc: bool,
+    shell: CString,
 }
 
 impl Mux {
-    pub fn new(initial: Pane) -> Self {
+    pub fn new(initial: Pane, shell: CString) -> Self {
         let mut panes = BTreeMap::new();
         panes.insert(1, initial);
-        Self { panes, active: 1, pending_esc: false }
+        Self { panes, active: 1, pending_esc: false, shell }
     }
 
     fn handle_tab(&mut self, tab_num: usize, stdin_fd: BorrowedFd, stdout_fd: BorrowedFd) {
@@ -35,7 +37,7 @@ impl Mux {
 
         if !self.panes.contains_key(&tab_num) {
             let ws = get_winsize(stdin_fd);
-            if let Ok(pty) = Pty::spawn(&ws, c"bash") {
+            if let Ok(pty) = Pty::spawn(&ws, &self.shell) {
                 let pane = Pane::new(pty, ws.ws_row, ws.ws_col);
                 self.panes.insert(tab_num, pane);
             } else {

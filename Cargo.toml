@@ -5,4 +5,4 @@ edition = "2024"
 
 [dependencies]
 alacritty_terminal = "0.25.1"
-nix = { version = "0.30.1", features = ["process", "term", "poll", "signal"] }
+nix = { version = "0.30.1", features = ["process", "term", "poll", "signal", "fs", "user"] }
