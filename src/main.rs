@@ -1,3 +1,4 @@
+mod bar;
 mod keybinds;
 mod mux;
 mod pane;
@@ -85,7 +86,7 @@ fn main() -> io::Result<()> {
     let shell = resolve_shell();
     let winsize = get_winsize(stdin.as_fd());
     let initial_pty = pty::Pty::spawn(&winsize, &shell).unwrap();
-    let initial_pane = pane::Pane::new(initial_pty, winsize.ws_row, winsize.ws_col);
+    let initial_pane = pane::Pane::new(initial_pty, winsize.ws_row - 1, winsize.ws_col);
     let mut mux = mux::Mux::new(initial_pane, shell);
 
     // Install SIGWINCH handler.

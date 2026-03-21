@@ -6,6 +6,7 @@ use nix::errno::Errno;
 use nix::sys::select;
 use nix::unistd;
 use alacritty_terminal::term::TermMode;
+use crate::bar::Bar;
 use crate::keybinds::{Action, Keybinds};
 use crate::pane::Pane;
 use crate::pty::Pty;
@@ -16,6 +17,7 @@ pub struct Mux {
     panes: BTreeMap<usize, Pane>,
     active: usize,
     keybinds: Keybinds,
+    bar: Bar,
     shell: CString,
 }
 
@@ -23,7 +25,20 @@ impl Mux {
     pub fn new(initial: Pane, shell: CString) -> Self {
         let mut panes = BTreeMap::new();
         panes.insert(1, initial);
-        Self { panes, active: 1, keybinds: Keybinds::new(), shell }
+        Self { panes, active: 1, keybinds: Keybinds::new(), bar: Bar::new(), shell }
+    }
+
+    fn render_bar(&self, stdin_fd: BorrowedFd, stdout_fd: BorrowedFd) {
+        let ws = get_winsize(stdin_fd);
+        let tabs: Vec<usize> = self.panes.keys().copied().collect();
+        let bar_content = self.bar.render(ws.ws_row, ws.ws_col, &tabs, self.active);
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"\x1B7");  // save cursor (before scroll region changes it)
+        buf.extend_from_slice(format!("\x1B[1;{}r", ws.ws_row - 1).as_bytes());
+        buf.extend_from_slice(&bar_content);
+        buf.extend_from_slice(b"\x1B8");  // restore cursor
+        let _ = unistd::write(stdout_fd, &buf);
     }
 
     fn handle_tab(&mut self, tab_num: usize, stdin_fd: BorrowedFd, stdout_fd: BorrowedFd) {
@@ -34,7 +49,7 @@ impl Mux {
         if !self.panes.contains_key(&tab_num) {
             let ws = get_winsize(stdin_fd);
             if let Ok(pty) = Pty::spawn(&ws, &self.shell) {
-                let pane = Pane::new(pty, ws.ws_row, ws.ws_col);
+                let pane = Pane::new(pty, ws.ws_row - 1, ws.ws_col);
                 self.panes.insert(tab_num, pane);
             } else {
                 return;
@@ -45,6 +60,7 @@ impl Mux {
         if let Some(pane) = self.panes.get(&self.active) {
             pane.render(stdout_fd);
         }
+        self.render_bar(stdin_fd, stdout_fd);
     }
 
     fn dispatch(&mut self, action: Action, stdin_fd: BorrowedFd, stdout_fd: BorrowedFd) {
@@ -61,17 +77,19 @@ impl Mux {
         forward
     }
 
-    fn handle_resize(&mut self, stdin_fd: BorrowedFd) {
+    fn handle_resize(&mut self, stdin_fd: BorrowedFd, stdout_fd: BorrowedFd) {
         let ws = get_winsize(stdin_fd);
         for pane in self.panes.values_mut() {
-            pane.resize(ws.ws_row, ws.ws_col);
+            pane.resize(ws.ws_row - 1, ws.ws_col);
         }
+        self.render_bar(stdin_fd, stdout_fd);
     }
 
     /// Read output from ready panes and handle dead panes.
     /// Returns true if all panes are dead (caller should exit).
-    fn read_panes(&mut self, ready_keys: &[(usize, RawFd)], stdout_fd: BorrowedFd) -> bool {
+    fn read_panes(&mut self, ready_keys: &[(usize, RawFd)], stdin_fd: BorrowedFd, stdout_fd: BorrowedFd) -> bool {
         let mut dead = Vec::new();
+        let mut need_bar = false;
         for &(key, _) in ready_keys {
             if let Some(pane) = self.panes.get_mut(&key) {
                 let mut buf = [0u8; 4096];
@@ -88,6 +106,7 @@ impl Mux {
                             } else {
                                 let _ = unistd::write(stdout_fd, &buf[..n]);
                             }
+                            need_bar = true;
                         }
                     }
                 }
@@ -105,6 +124,10 @@ impl Mux {
             if let Some(pane) = self.panes.get(&self.active) {
                 pane.render(stdout_fd);
             }
+            need_bar = true;
+        }
+        if !dead.is_empty() || need_bar {
+            self.render_bar(stdin_fd, stdout_fd);
         }
         false
     }
@@ -129,6 +152,7 @@ impl Mux {
 
     pub fn run(&mut self, stdin_fd: BorrowedFd, stdout_fd: BorrowedFd) {
         let stdin_raw: RawFd = stdin_fd.as_raw_fd();
+        self.render_bar(stdin_fd, stdout_fd);
 
         loop {
             let master_raws: Vec<(usize, RawFd)> = self.panes.iter()
@@ -146,7 +170,7 @@ impl Mux {
             match select::select(None, &mut read_fds, None, None, None) {
                 Err(Errno::EINTR) => {
                     if SIGWINCH_RECEIVED.swap(false, Ordering::Relaxed) {
-                        self.handle_resize(stdin_fd);
+                        self.handle_resize(stdin_fd, stdout_fd);
                     }
                     continue;
                 }
@@ -160,7 +184,7 @@ impl Mux {
                 .copied()
                 .collect();
 
-            if self.read_panes(&ready_keys, stdout_fd) {
+            if self.read_panes(&ready_keys, stdin_fd, stdout_fd) {
                 return;
             }
             if stdin_ready && self.read_stdin(stdin_fd, stdout_fd) {
