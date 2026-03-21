@@ -19,13 +19,10 @@ impl Bar {
         // Build the tab content.
         let mut content = String::new();
         for &tab in tabs {
-            if !content.is_empty() {
-                content.push(' ');
-            }
             if tab == active {
                 content.push_str(&format!("[{}]", tab));
             } else {
-                content.push_str(&format!("{}", tab));
+                content.push_str(&format!(" {} ", tab));
             }
         }
 
