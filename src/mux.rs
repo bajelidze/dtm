@@ -471,6 +471,56 @@ impl Mux {
         out
     }
 
+    /// Remove dead panes from all tabs, update focus, drop empty tabs.
+    /// Returns true if all tabs are gone (should exit).
+    fn remove_dead_panes(&mut self, dead: &[usize]) -> bool {
+        for &pane_id in dead {
+            self.panes.remove(&pane_id);
+        }
+
+        for tab in self.tabs.values_mut() {
+            if dead.contains(&tab.focused) {
+                let idx = tab.pane_ids.iter().position(|&id| id == tab.focused).unwrap_or(0);
+                // Pick the nearest pane before the dead one; skip other dead panes.
+                let prev = tab.pane_ids.iter().take(idx).rev()
+                    .chain(tab.pane_ids.iter().skip(idx + 1).rev())
+                    .find(|id| !dead.contains(id))
+                    .copied();
+                tab.pane_ids.retain(|id| !dead.contains(id));
+                tab.focused = prev
+                    .or_else(|| tab.pane_ids.last().copied())
+                    .unwrap_or(0);
+            } else {
+                tab.pane_ids.retain(|id| !dead.contains(id));
+            }
+        }
+
+        self.tabs.retain(|_, tab| !tab.pane_ids.is_empty());
+
+        if self.tabs.is_empty() {
+            return true;
+        }
+        if !self.tabs.contains_key(&self.active) {
+            self.active = *self.tabs.keys().next().unwrap();
+        }
+        false
+    }
+
+    /// Render the focused pane's cursor at its layout position.
+    fn render_focused_cursor(&self) -> Vec<u8> {
+        let focused_id = match self.tabs.get(&self.active) {
+            Some(tab) => tab.focused,
+            None => return Vec::new(),
+        };
+        let regions = self.active_regions();
+        if let Some(&(_, region)) = regions.iter().find(|(id, _)| *id == focused_id) {
+            if let Some(pane) = self.panes.get(&focused_id) {
+                return pane.cursor_at(region.row, region.col);
+            }
+        }
+        Vec::new()
+    }
+
     /// Read output from ready panes and handle dead panes.
     pub fn read_panes(&mut self, ready_keys: &[(usize, RawFd)]) -> (Vec<u8>, bool) {
         let mut out = Vec::new();
@@ -478,9 +528,9 @@ impl Mux {
 
         let active_regions = self.active_regions();
         let active_pane_ids: Vec<usize> = active_regions.iter().map(|(id, _)| *id).collect();
-
         let mut any_rendered = false;
 
+        // Read PTY data and render visible panes.
         for &(pane_id, _) in ready_keys {
             let pane = match self.panes.get_mut(&pane_id) {
                 Some(p) => p,
@@ -496,7 +546,6 @@ impl Mux {
                     Err(_) => { dead.push(pane_id); break; }
                 }
             }
-
             if got_data && active_pane_ids.contains(&pane_id) {
                 if pane.display_offset() > 0 {
                     pane.reset_damage();
@@ -508,79 +557,28 @@ impl Mux {
             }
         }
 
+        // Handle dead panes.
         if !dead.is_empty() {
             let active_affected = dead.iter().any(|id| active_pane_ids.contains(id));
-
-            for &pane_id in &dead {
-                self.panes.remove(&pane_id);
-            }
-
-            // Remove dead panes from tabs, focusing the previous pane.
-            for tab in self.tabs.values_mut() {
-                let prev = if dead.contains(&tab.focused) {
-                    // Find the index of the focused pane before removal.
-                    let idx = tab.pane_ids.iter().position(|&id| id == tab.focused).unwrap_or(0);
-                    // Pick the nearest pane before the dead one; skip other dead panes.
-                    tab.pane_ids.iter().take(idx).rev()
-                        .chain(tab.pane_ids.iter().skip(idx + 1).rev())
-                        .find(|id| !dead.contains(id))
-                        .copied()
-                } else {
-                    None
-                };
-                tab.pane_ids.retain(|id| !dead.contains(id));
-                if let Some(prev_id) = prev {
-                    tab.focused = prev_id;
-                } else if !tab.pane_ids.contains(&tab.focused) {
-                    tab.focused = tab.pane_ids.last().copied().unwrap_or(0);
-                }
-            }
-
-            // Remove empty tabs.
-            let dead_tabs: Vec<usize> = self.tabs.iter()
-                .filter(|(_, tab)| tab.pane_ids.is_empty())
-                .map(|(&num, _)| num)
-                .collect();
-            for num in dead_tabs {
-                self.tabs.remove(&num);
-            }
-
-            if self.tabs.is_empty() {
+            if self.remove_dead_panes(&dead) {
                 return (out, true);
             }
-
-            if !self.tabs.contains_key(&self.active) {
-                self.active = *self.tabs.keys().next().unwrap();
-            }
-
             if active_affected {
-                // Resize remaining panes to fill the new layout.
                 self.resize_tab_panes(self.active);
-
                 out = Vec::new();
                 out.extend_from_slice(b"\x1B[2J\x1B[H");
                 out.extend_from_slice(&self.render_active_tab());
-                out.extend_from_slice(&self.render_bar());
                 any_rendered = false;
-            } else {
-                out.extend_from_slice(&self.render_bar());
             }
+            out.extend_from_slice(&self.render_bar());
         }
 
-        // Reposition cursor after incremental renders.
         if any_rendered {
-            let focused_id = self.tabs.get(&self.active).map(|t| t.focused).unwrap_or(0);
-            let regions = self.active_regions();
-            if let Some(&(_, region)) = regions.iter().find(|(id, _)| *id == focused_id) {
-                if let Some(pane) = self.panes.get(&focused_id) {
-                    out.extend_from_slice(&pane.cursor_at(region.row, region.col));
-                }
-            }
+            out.extend_from_slice(&self.render_focused_cursor());
         }
 
         let modes = self.focused_pane_modes();
         out.extend_from_slice(&self.sync_modes(modes));
-
         (out, false)
     }
 
