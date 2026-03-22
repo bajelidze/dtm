@@ -71,6 +71,10 @@ impl Pane {
         &self.pty
     }
 
+    pub fn app_cursor(&self) -> bool {
+        self.term.mode().contains(TermMode::APP_CURSOR)
+    }
+
     /// Resize both the virtual terminal and the underlying PTY.
     pub fn resize(&mut self, rows: u16, cols: u16) {
         let size = TermSize { rows: rows as usize, cols: cols as usize };
@@ -182,6 +186,7 @@ impl Pane {
                 format!("\x1B[{};{}H", damaged.line + 1, damaged.left + 1).as_bytes()
             );
 
+            buf.extend_from_slice(b"\x1B[0m");
             let mut sgr = SgrState::new();
 
             for col in damaged.left..=damaged.right {
