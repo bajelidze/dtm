@@ -1,16 +1,22 @@
 use std::collections::BTreeMap;
 use std::ffi::CString;
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
-use std::sync::atomic::Ordering;
+use std::os::fd::{AsRawFd, RawFd};
 use nix::errno::Errno;
-use nix::sys::select;
 use nix::unistd;
 use crate::bar::Bar;
 use crate::keybinds::{Action, Keybinds};
 use crate::pane::Pane;
 use crate::pty::Pty;
-use crate::SIGWINCH_RECEIVED;
-use crate::get_winsize;
+
+/// Result of processing stdin input through keybinds.
+pub struct InputResult {
+    /// Whether a detach was requested.
+    pub detach: bool,
+    /// ANSI output from keybind-triggered renders (tab switches, etc.).
+    pub output: Vec<u8>,
+    /// Bytes to forward to the active pane's PTY.
+    pub forward: Vec<u8>,
+}
 
 pub struct Mux {
     panes: BTreeMap<usize, Pane>,
@@ -19,105 +25,124 @@ pub struct Mux {
     bar: Bar,
     shell: CString,
     app_cursor: bool,
+    rows: u16,
+    cols: u16,
 }
 
 impl Mux {
-    pub fn new(initial: Pane, shell: CString) -> Self {
+    pub fn new(initial: Pane, shell: CString, rows: u16, cols: u16) -> Self {
         let mut panes = BTreeMap::new();
         panes.insert(1, initial);
-        Self { panes, active: 1, keybinds: Keybinds::new(), bar: Bar::new(), shell, app_cursor: false }
+        Self {
+            panes, active: 1, keybinds: Keybinds::new(), bar: Bar::new(),
+            shell, app_cursor: false, rows, cols,
+        }
     }
 
-    fn set_scroll_region(&self, stdin_fd: BorrowedFd, stdout_fd: BorrowedFd) {
-        let ws = get_winsize(stdin_fd);
+    pub fn set_scroll_region(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(b"\x1B7");
-        buf.extend_from_slice(format!("\x1B[1;{}r", ws.ws_row - 1).as_bytes());
+        buf.extend_from_slice(format!("\x1B[1;{}r", self.rows - 1).as_bytes());
         buf.extend_from_slice(b"\x1B8");
-        let _ = unistd::write(stdout_fd, &buf);
+        buf
     }
 
-    fn render_bar(&self, stdin_fd: BorrowedFd, stdout_fd: BorrowedFd) {
-        let ws = get_winsize(stdin_fd);
+    pub fn render_bar(&self) -> Vec<u8> {
         let tabs: Vec<usize> = self.panes.keys().copied().collect();
-        let bar_content = self.bar.render(ws.ws_row, ws.ws_col, &tabs, self.active);
+        let bar_content = self.bar.render(self.rows, self.cols, &tabs, self.active);
 
         let mut buf = Vec::new();
         buf.extend_from_slice(b"\x1B7");
         buf.extend_from_slice(&bar_content);
         buf.extend_from_slice(b"\x1B8");
-        let _ = unistd::write(stdout_fd, &buf);
+        buf
     }
 
-    fn sync_app_cursor(&mut self, app_cursor: bool, stdout_fd: BorrowedFd) {
+    fn sync_app_cursor(&mut self, app_cursor: bool) -> Vec<u8> {
         if app_cursor != self.app_cursor {
             self.app_cursor = app_cursor;
             if app_cursor {
-                let _ = unistd::write(stdout_fd, b"\x1B[?1h");
+                return b"\x1B[?1h".to_vec();
             } else {
-                let _ = unistd::write(stdout_fd, b"\x1B[?1l");
+                return b"\x1B[?1l".to_vec();
             }
         }
+        Vec::new()
     }
 
-    fn handle_tab(&mut self, tab_num: usize, stdin_fd: BorrowedFd, stdout_fd: BorrowedFd) {
+    fn handle_tab(&mut self, tab_num: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+
         if tab_num == self.active {
-            return;
+            return out;
         }
 
         if !self.panes.contains_key(&tab_num) {
-            let ws = get_winsize(stdin_fd);
+            let ws = nix::pty::Winsize {
+                ws_row: self.rows, ws_col: self.cols,
+                ws_xpixel: 0, ws_ypixel: 0,
+            };
             if let Ok(pty) = Pty::spawn(&ws, &self.shell) {
-                let pane = Pane::new(pty, ws.ws_row - 1, ws.ws_col);
+                let pane = Pane::new(pty, self.rows - 1, self.cols);
                 self.panes.insert(tab_num, pane);
             } else {
-                return;
+                return out;
             }
         }
 
         self.active = tab_num;
         let app_cursor = if let Some(pane) = self.panes.get(&self.active) {
-            pane.render(stdout_fd);
+            out.extend_from_slice(&pane.render());
             pane.app_cursor()
         } else {
             false
         };
-        self.sync_app_cursor(app_cursor, stdout_fd);
-        self.render_bar(stdin_fd, stdout_fd);
+        out.extend_from_slice(&self.sync_app_cursor(app_cursor));
+        out.extend_from_slice(&self.render_bar());
+        out
     }
 
-    fn dispatch(&mut self, action: Action, stdin_fd: BorrowedFd, stdout_fd: BorrowedFd) {
-        match action {
-            Action::SwitchTab(tab_num) => self.handle_tab(tab_num, stdin_fd, stdout_fd),
-        }
-    }
-
-    fn process_stdin(&mut self, buf: &[u8], stdin_fd: BorrowedFd, stdout_fd: BorrowedFd) -> Vec<u8> {
+    /// Process stdin input through keybinds.
+    /// Returns detach flag, render output, and bytes to forward to PTY.
+    pub fn process_stdin(&mut self, buf: &[u8]) -> InputResult {
         let (actions, forward) = self.keybinds.feed(buf);
+        let mut output = Vec::new();
+        let mut detach = false;
         for action in actions {
-            self.dispatch(action, stdin_fd, stdout_fd);
+            match action {
+                Action::SwitchTab(tab_num) => {
+                    output.extend_from_slice(&self.handle_tab(tab_num));
+                }
+                Action::Detach => {
+                    detach = true;
+                }
+            }
         }
-        forward
+        InputResult { detach, output, forward }
     }
 
-    fn handle_resize(&mut self, stdin_fd: BorrowedFd, stdout_fd: BorrowedFd) {
-        let ws = get_winsize(stdin_fd);
+    /// Handle a terminal resize. Returns ANSI output.
+    pub fn handle_resize(&mut self, rows: u16, cols: u16) -> Vec<u8> {
+        self.rows = rows;
+        self.cols = cols;
         for pane in self.panes.values_mut() {
-            pane.resize(ws.ws_row - 1, ws.ws_col);
+            pane.resize(rows - 1, cols);
         }
-        self.set_scroll_region(stdin_fd, stdout_fd);
-        self.render_bar(stdin_fd, stdout_fd);
+        let mut out = self.set_scroll_region();
+        out.extend_from_slice(&self.render_bar());
+        out
     }
 
     /// Read output from ready panes and handle dead panes.
-    /// Returns true if all panes are dead (caller should exit).
-    fn read_panes(&mut self, ready_keys: &[(usize, RawFd)], stdin_fd: BorrowedFd, stdout_fd: BorrowedFd) -> bool {
+    /// Returns (output_bytes, all_dead).
+    pub fn read_panes(&mut self, ready_keys: &[(usize, RawFd)]) -> (Vec<u8>, bool) {
+        let mut out = Vec::new();
         let mut dead = Vec::new();
         let mut need_bar = false;
+
         for &(key, _) in ready_keys {
             if let Some(pane) = self.panes.get_mut(&key) {
                 let mut buf = [0u8; 4096];
-                // Drain all available data before rendering (fd is non-blocking).
                 let mut got_data = false;
                 loop {
                     match unistd::read(pane.pty().master_fd(), &mut buf) {
@@ -128,7 +153,8 @@ impl Mux {
                     }
                 }
                 if got_data && key == self.active {
-                    let full = pane.render_incremental(stdout_fd);
+                    let (rendered, full) = pane.render_incremental();
+                    out.extend_from_slice(&rendered);
                     if full {
                         need_bar = true;
                     }
@@ -140,85 +166,49 @@ impl Mux {
             self.panes.remove(key);
         }
         if self.panes.is_empty() {
-            return true;
+            return (out, true);
         }
         if !self.panes.contains_key(&self.active) {
             self.active = *self.panes.keys().next().unwrap();
             if let Some(pane) = self.panes.get(&self.active) {
-                pane.render(stdout_fd);
+                out.extend_from_slice(&pane.render());
             }
             need_bar = true;
         }
         if !dead.is_empty() || need_bar {
-            self.render_bar(stdin_fd, stdout_fd);
+            out.extend_from_slice(&self.render_bar());
         }
 
         let app_cursor = self.panes.get(&self.active)
             .map(|p| p.app_cursor()).unwrap_or(false);
-        self.sync_app_cursor(app_cursor, stdout_fd);
+        out.extend_from_slice(&self.sync_app_cursor(app_cursor));
 
-        false
+        (out, false)
     }
 
-    /// Read from stdin, process keybinds, forward to active pane.
-    /// Returns true if stdin is closed (caller should exit).
-    fn read_stdin(&mut self, stdin_fd: BorrowedFd, stdout_fd: BorrowedFd) -> bool {
-        let mut buf = [0u8; 4096];
-        match unistd::read(stdin_fd, &mut buf) {
-            Ok(0) | Err(_) => true,
-            Ok(n) => {
-                let forward = self.process_stdin(&buf[..n], stdin_fd, stdout_fd);
-                if !forward.is_empty() {
-                    if let Some(pane) = self.panes.get(&self.active) {
-                        let _ = unistd::write(pane.pty().master_fd(), &forward);
-                    }
-                }
-                false
-            }
+    /// Full render for reattach: clear screen + scroll region + pane + bar.
+    pub fn full_render(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"\x1B[2J\x1B[H");
+        out.extend_from_slice(&self.set_scroll_region());
+        if let Some(pane) = self.panes.get(&self.active) {
+            out.extend_from_slice(&pane.render());
         }
+        out.extend_from_slice(&self.render_bar());
+        out
     }
 
-    pub fn run(&mut self, stdin_fd: BorrowedFd, stdout_fd: BorrowedFd) {
-        let stdin_raw: RawFd = stdin_fd.as_raw_fd();
-        self.set_scroll_region(stdin_fd, stdout_fd);
-        self.render_bar(stdin_fd, stdout_fd);
+    /// Return all PTY master fds for use in select().
+    pub fn pty_fds(&self) -> Vec<(usize, RawFd)> {
+        self.panes.iter()
+            .map(|(&key, p)| (key, p.pty().master_fd().as_raw_fd()))
+            .collect()
+    }
 
-        loop {
-            let master_raws: Vec<(usize, RawFd)> = self.panes.iter()
-                .map(|(&key, p)| (key, p.pty().master_fd().as_raw_fd()))
-                .collect();
-
-            let mut read_fds = select::FdSet::new();
-            unsafe {
-                read_fds.insert(BorrowedFd::borrow_raw(stdin_raw));
-                for &(_, raw) in &master_raws {
-                    read_fds.insert(BorrowedFd::borrow_raw(raw));
-                }
-            }
-
-            match select::select(None, &mut read_fds, None, None, None) {
-                Err(Errno::EINTR) => {
-                    if SIGWINCH_RECEIVED.swap(false, Ordering::Relaxed) {
-                        self.handle_resize(stdin_fd, stdout_fd);
-                    }
-                    continue;
-                }
-                Err(_) => break,
-                Ok(_) => {}
-            }
-
-            let stdin_ready = unsafe { read_fds.contains(BorrowedFd::borrow_raw(stdin_raw)) };
-            let ready_keys: Vec<(usize, RawFd)> = master_raws.iter()
-                .filter(|(_, raw)| unsafe { read_fds.contains(BorrowedFd::borrow_raw(*raw)) })
-                .copied()
-                .collect();
-
-            if self.read_panes(&ready_keys, stdin_fd, stdout_fd) {
-                return;
-            }
-            if stdin_ready && self.read_stdin(stdin_fd, stdout_fd) {
-                break;
-            }
+    /// Write bytes to the active pane's PTY.
+    pub fn write_to_active(&self, data: &[u8]) {
+        if let Some(pane) = self.panes.get(&self.active) {
+            let _ = unistd::write(pane.pty().master_fd(), data);
         }
     }
 }

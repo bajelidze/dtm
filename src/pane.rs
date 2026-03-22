@@ -88,8 +88,8 @@ impl Pane {
         let _ = self.pty.resize(&ws);
     }
 
-    /// Render this pane's screen to stdout.
-    pub fn render(&self, stdout_fd: BorrowedFd) {
+    /// Render this pane's full screen content and return the ANSI bytes.
+    pub fn render(&self) -> Vec<u8> {
         let content = self.term.renderable_content();
         let rows = self.term.screen_lines();
         let cols = self.term.columns();
@@ -149,12 +149,12 @@ impl Pane {
             write_cursor_shape(&mut buf, self.term.cursor_style());
         }
 
-        let _ = unistd::write(stdout_fd, &buf);
+        buf
     }
 
     /// Render only damaged cells since last call.
-    /// Returns true if a full redraw occurred (caller should redraw bar).
-    pub fn render_incremental(&mut self, stdout_fd: BorrowedFd) -> bool {
+    /// Returns (output_bytes, was_full_redraw).
+    pub fn render_incremental(&mut self) -> (Vec<u8>, bool) {
         let damage = match self.term.damage() {
             TermDamage::Full => None,
             TermDamage::Partial(iter) => Some(iter.collect::<Vec<_>>()),
@@ -163,19 +163,19 @@ impl Pane {
 
         match damage {
             None => {
-                self.render(stdout_fd);
-                true
+                let buf = self.render();
+                (buf, true)
             }
             Some(lines) => {
-                self.render_damaged(&lines, stdout_fd);
-                false
+                let buf = self.render_damaged(&lines);
+                (buf, false)
             }
         }
     }
 
-    fn render_damaged(&self, lines: &[LineDamageBounds], stdout_fd: BorrowedFd) {
+    fn render_damaged(&self, lines: &[LineDamageBounds]) -> Vec<u8> {
         if lines.is_empty() {
-            return;
+            return Vec::new();
         }
 
         let grid = self.term.grid();
@@ -213,7 +213,7 @@ impl Pane {
             buf.extend_from_slice(b"\x1B[?25l");
         }
 
-        let _ = unistd::write(stdout_fd, &buf);
+        buf
     }
 }
 

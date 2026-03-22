@@ -3,6 +3,7 @@ const ESC: u8 = 0x1B;
 #[derive(Debug, Clone, Copy)]
 pub enum Action {
     SwitchTab(usize),
+    Detach,
 }
 
 pub struct Keybinds {
@@ -17,6 +18,7 @@ impl Keybinds {
         for digit in 1..=9u8 {
             bindings.push((vec![ESC, b'0' + digit], Action::SwitchTab(digit as usize)));
         }
+        bindings.push((vec![ESC, b'd'], Action::Detach));
         let max_len = bindings.iter().map(|(seq, _)| seq.len()).max().unwrap_or(0);
         Self { bindings, pending: Vec::new(), max_len }
     }
