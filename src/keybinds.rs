@@ -6,6 +6,9 @@ pub enum Action {
     Detach,
     ScrollPageUp,
     ScrollPageDown,
+    NewPane,
+    FocusDown,
+    FocusUp,
 }
 
 pub struct Keybinds {
@@ -21,6 +24,9 @@ impl Keybinds {
             bindings.push((vec![ESC, b'0' + digit], Action::SwitchTab(digit as usize)));
         }
         bindings.push((vec![ESC, b'd'], Action::Detach));
+        bindings.push((vec![ESC, 0x0D], Action::NewPane));   // Alt+Enter
+        bindings.push((vec![ESC, b'j'], Action::FocusDown));  // Alt+j
+        bindings.push((vec![ESC, b'k'], Action::FocusUp));    // Alt+k
         // Shift+PageUp / Shift+PageDown
         bindings.push((vec![ESC, b'[', b'5', b';', b'2', b'~'], Action::ScrollPageUp));
         bindings.push((vec![ESC, b'[', b'6', b';', b'2', b'~'], Action::ScrollPageDown));

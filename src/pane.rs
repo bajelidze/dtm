@@ -102,21 +102,40 @@ impl Pane {
         let _ = self.pty.resize(&ws);
     }
 
-    /// Render this pane's full screen content and return the ANSI bytes.
+    /// Render this pane's full content with cursor handling.
     pub fn render(&self) -> Vec<u8> {
+        let mut buf = self.render_at(0, 0);
+        buf.extend_from_slice(&self.cursor_at(0, 0));
+        buf
+    }
+
+    /// Render this pane's content at a screen offset (no cursor handling).
+    pub fn render_at(&self, row_off: u16, col_off: u16) -> Vec<u8> {
         let content = self.term.renderable_content();
         let rows = self.term.screen_lines();
         let cols = self.term.columns();
         let offset = content.display_offset as i32;
 
-        let mut buf = Vec::with_capacity(rows * cols);
+        let mut buf = Vec::with_capacity(rows * cols * 2);
 
-        // Reset attributes and clear screen, home cursor.
-        buf.extend_from_slice(b"\x1B[0m\x1B[2J\x1B[H");
+        // Clear the pane region by writing spaces.
+        buf.extend_from_slice(b"\x1B[0m");
+        for r in 0..rows {
+            buf.extend_from_slice(
+                format!("\x1B[{};{}H",
+                    row_off as usize + r + 1,
+                    col_off as usize + 1
+                ).as_bytes()
+            );
+            for _ in 0..cols {
+                buf.push(b' ');
+            }
+        }
 
+        buf.extend_from_slice(b"\x1B[0m");
         let mut sgr = SgrState::new();
-        let mut cur_row: i32 = 0;
-        let mut cur_col: usize = 0;
+        let mut cur_row: i32 = -1;
+        let mut cur_col: usize = usize::MAX;
 
         for indexed in content.display_iter {
             let point = indexed.point;
@@ -127,7 +146,7 @@ impl Pane {
                 continue;
             }
 
-            // Skip default cells — screen is already cleared.
+            // Skip default cells — region is already cleared.
             if cell.c == ' '
                 && cell.fg == Color::Named(NamedColor::Foreground)
                 && cell.bg == Color::Named(NamedColor::Background)
@@ -136,10 +155,12 @@ impl Pane {
                 continue;
             }
 
-            // Position cursor if not at expected position.
             if screen_row != cur_row || point.column.0 != cur_col {
                 buf.extend_from_slice(
-                    format!("\x1B[{};{}H", screen_row + 1, point.column.0 + 1).as_bytes()
+                    format!("\x1B[{};{}H",
+                        row_off as i32 + screen_row + 1,
+                        col_off as usize + point.column.0 + 1
+                    ).as_bytes()
                 );
             }
 
@@ -153,30 +174,43 @@ impl Pane {
         }
 
         buf.extend_from_slice(b"\x1B[0m");
-
-        let cursor = content.cursor;
-        let cursor_row = cursor.point.line.0 + offset;
-        if cursor_row >= 0 && cursor_row < rows as i32 {
-            buf.extend_from_slice(
-                format!("\x1B[{};{}H", cursor_row + 1, cursor.point.column.0 + 1).as_bytes()
-            );
-            if cursor.shape == CursorShape::Hidden {
-                buf.extend_from_slice(b"\x1B[?25l");
-            } else {
-                buf.extend_from_slice(b"\x1B[?25h");
-                write_cursor_shape(&mut buf, self.term.cursor_style());
-            }
-        } else {
-            // Cursor not in viewport (scrolled away), hide it.
-            buf.extend_from_slice(b"\x1B[?25l");
-        }
-
         buf
     }
 
-    /// Render only damaged cells since last call.
+    /// Position and show/hide cursor for this pane at a screen offset.
+    pub fn cursor_at(&self, row_off: u16, col_off: u16) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        if self.term.grid().display_offset() > 0 {
+            buf.extend_from_slice(b"\x1B[?25l");
+            return buf;
+        }
+
+        let cursor = self.term.grid().cursor.point;
+        let rows = self.term.screen_lines() as i32;
+
+        if cursor.line.0 >= 0 && cursor.line.0 < rows {
+            buf.extend_from_slice(
+                format!("\x1B[{};{}H",
+                    row_off as i32 + cursor.line.0 + 1,
+                    col_off as usize + cursor.column.0 + 1
+                ).as_bytes()
+            );
+            if self.term.mode().contains(TermMode::SHOW_CURSOR) {
+                buf.extend_from_slice(b"\x1B[?25h");
+                write_cursor_shape(&mut buf, self.term.cursor_style());
+            } else {
+                buf.extend_from_slice(b"\x1B[?25l");
+            }
+        } else {
+            buf.extend_from_slice(b"\x1B[?25l");
+        }
+        buf
+    }
+
+    /// Incremental render at a screen offset (no cursor handling).
     /// Returns (output_bytes, was_full_redraw).
-    pub fn render_incremental(&mut self) -> (Vec<u8>, bool) {
+    pub fn render_incremental_at(&mut self, row_off: u16, col_off: u16) -> (Vec<u8>, bool) {
         let damage = match self.term.damage() {
             TermDamage::Full => None,
             TermDamage::Partial(iter) => Some(iter.collect::<Vec<_>>()),
@@ -185,14 +219,48 @@ impl Pane {
 
         match damage {
             None => {
-                let buf = self.render();
+                let buf = self.render_at(row_off, col_off);
                 (buf, true)
             }
             Some(lines) => {
-                let buf = self.render_damaged(&lines);
+                let buf = self.render_damaged_at(&lines, row_off, col_off);
                 (buf, false)
             }
         }
+    }
+
+    fn render_damaged_at(&self, lines: &[LineDamageBounds], row_off: u16, col_off: u16) -> Vec<u8> {
+        if lines.is_empty() {
+            return Vec::new();
+        }
+
+        let grid = self.term.grid();
+        let mut buf = Vec::new();
+
+        for damaged in lines {
+            buf.extend_from_slice(
+                format!("\x1B[{};{}H",
+                    row_off as usize + damaged.line + 1,
+                    col_off as usize + damaged.left + 1
+                ).as_bytes()
+            );
+
+            buf.extend_from_slice(b"\x1B[0m");
+            let mut sgr = SgrState::new();
+
+            for col in damaged.left..=damaged.right {
+                let cell = &grid[Line(damaged.line as i32)][Column(col)];
+
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+
+                write_cell(&mut buf, cell.c, cell.flags, cell.fg, cell.bg, &mut sgr);
+            }
+        }
+
+        buf.extend_from_slice(b"\x1B[0m");
+        buf
     }
 
     /// Incrementally render a scroll by shifting existing content and
@@ -271,48 +339,6 @@ impl Pane {
         }
     }
 
-    fn render_damaged(&self, lines: &[LineDamageBounds]) -> Vec<u8> {
-        if lines.is_empty() {
-            return Vec::new();
-        }
-
-        let grid = self.term.grid();
-        let mut buf = Vec::new();
-
-        for damaged in lines {
-            buf.extend_from_slice(
-                format!("\x1B[{};{}H", damaged.line + 1, damaged.left + 1).as_bytes()
-            );
-
-            buf.extend_from_slice(b"\x1B[0m");
-            let mut sgr = SgrState::new();
-
-            for col in damaged.left..=damaged.right {
-                let cell = &grid[Line(damaged.line as i32)][Column(col)];
-
-                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                    continue;
-                }
-
-                write_cell(&mut buf, cell.c, cell.flags, cell.fg, cell.bg, &mut sgr);
-            }
-        }
-
-        buf.extend_from_slice(b"\x1B[0m");
-
-        let cursor_point = grid.cursor.point;
-        buf.extend_from_slice(
-            format!("\x1B[{};{}H", cursor_point.line.0 + 1, cursor_point.column.0 + 1).as_bytes()
-        );
-        if self.term.mode().contains(TermMode::SHOW_CURSOR) {
-            buf.extend_from_slice(b"\x1B[?25h");
-            write_cursor_shape(&mut buf, self.term.cursor_style());
-        } else {
-            buf.extend_from_slice(b"\x1B[?25l");
-        }
-
-        buf
-    }
 }
 
 fn write_cursor_shape(buf: &mut Vec<u8>, style: CursorStyle) {

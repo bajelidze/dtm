@@ -2,6 +2,7 @@ mod bar;
 mod cli;
 mod client;
 mod keybinds;
+mod layout;
 mod mux;
 mod pane;
 mod protocol;
