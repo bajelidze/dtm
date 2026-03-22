@@ -3,6 +3,7 @@ use std::ffi::CString;
 use std::os::fd::{AsRawFd, RawFd};
 use nix::errno::Errno;
 use nix::unistd;
+use alacritty_terminal::term::TermMode;
 use crate::bar::Bar;
 use crate::keybinds::{Action, Keybinds};
 use crate::pane::Pane;
@@ -18,13 +19,25 @@ pub struct InputResult {
     pub forward: Vec<u8>,
 }
 
+/// Terminal modes that need to be synced to the outer terminal.
+const SYNCED_MODES: &[(TermMode, &[u8], &[u8])] = &[
+    (TermMode::APP_CURSOR,        b"\x1B[?1h",    b"\x1B[?1l"),
+    (TermMode::MOUSE_REPORT_CLICK,b"\x1B[?1000h", b"\x1B[?1000l"),
+    (TermMode::MOUSE_DRAG,        b"\x1B[?1002h", b"\x1B[?1002l"),
+    (TermMode::MOUSE_MOTION,      b"\x1B[?1003h", b"\x1B[?1003l"),
+    (TermMode::UTF8_MOUSE,        b"\x1B[?1005h", b"\x1B[?1005l"),
+    (TermMode::SGR_MOUSE,         b"\x1B[?1006h", b"\x1B[?1006l"),
+    (TermMode::BRACKETED_PASTE,   b"\x1B[?2004h", b"\x1B[?2004l"),
+    (TermMode::FOCUS_IN_OUT,      b"\x1B[?1004h", b"\x1B[?1004l"),
+];
+
 pub struct Mux {
     panes: BTreeMap<usize, Pane>,
     active: usize,
     keybinds: Keybinds,
     bar: Bar,
     shell: CString,
-    app_cursor: bool,
+    synced: TermMode,
     rows: u16,
     cols: u16,
 }
@@ -35,7 +48,7 @@ impl Mux {
         panes.insert(1, initial);
         Self {
             panes, active: 1, keybinds: Keybinds::new(), bar: Bar::new(),
-            shell, app_cursor: false, rows, cols,
+            shell, synced: TermMode::empty(), rows, cols,
         }
     }
 
@@ -58,16 +71,19 @@ impl Mux {
         buf
     }
 
-    fn sync_app_cursor(&mut self, app_cursor: bool) -> Vec<u8> {
-        if app_cursor != self.app_cursor {
-            self.app_cursor = app_cursor;
-            if app_cursor {
-                return b"\x1B[?1h".to_vec();
-            } else {
-                return b"\x1B[?1l".to_vec();
+    fn sync_modes(&mut self, current: TermMode) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for &(flag, on_seq, off_seq) in SYNCED_MODES {
+            let was = self.synced.contains(flag);
+            let now = current.contains(flag);
+            if now && !was {
+                buf.extend_from_slice(on_seq);
+            } else if !now && was {
+                buf.extend_from_slice(off_seq);
             }
         }
-        Vec::new()
+        self.synced = current & SYNCED_MODES.iter().fold(TermMode::empty(), |acc, &(f, _, _)| acc | f);
+        buf
     }
 
     fn handle_tab(&mut self, tab_num: usize) -> Vec<u8> {
@@ -91,13 +107,13 @@ impl Mux {
         }
 
         self.active = tab_num;
-        let app_cursor = if let Some(pane) = self.panes.get(&self.active) {
+        let modes = if let Some(pane) = self.panes.get(&self.active) {
             out.extend_from_slice(&pane.render());
-            pane.app_cursor()
+            pane.term_modes()
         } else {
-            false
+            TermMode::empty()
         };
-        out.extend_from_slice(&self.sync_app_cursor(app_cursor));
+        out.extend_from_slice(&self.sync_modes(modes));
         out.extend_from_slice(&self.render_bar());
         out
     }
@@ -179,15 +195,15 @@ impl Mux {
             out.extend_from_slice(&self.render_bar());
         }
 
-        let app_cursor = self.panes.get(&self.active)
-            .map(|p| p.app_cursor()).unwrap_or(false);
-        out.extend_from_slice(&self.sync_app_cursor(app_cursor));
+        let modes = self.panes.get(&self.active)
+            .map(|p| p.term_modes()).unwrap_or(TermMode::empty());
+        out.extend_from_slice(&self.sync_modes(modes));
 
         (out, false)
     }
 
     /// Full render for reattach: clear screen + scroll region + pane + bar.
-    pub fn full_render(&self) -> Vec<u8> {
+    pub fn full_render(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(b"\x1B[2J\x1B[H");
         out.extend_from_slice(&self.set_scroll_region());
@@ -195,6 +211,10 @@ impl Mux {
             out.extend_from_slice(&pane.render());
         }
         out.extend_from_slice(&self.render_bar());
+        // Sync all terminal modes so the outer terminal matches the pane's state.
+        let modes = self.panes.get(&self.active)
+            .map(|p| p.term_modes()).unwrap_or(TermMode::empty());
+        out.extend_from_slice(&self.sync_modes(modes));
         out
     }
 

@@ -71,8 +71,9 @@ impl Pane {
         &self.pty
     }
 
-    pub fn app_cursor(&self) -> bool {
-        self.term.mode().contains(TermMode::APP_CURSOR)
+    /// Return the current terminal mode flags relevant to the outer terminal.
+    pub fn term_modes(&self) -> TermMode {
+        *self.term.mode()
     }
 
     /// Resize both the virtual terminal and the underlying PTY.
