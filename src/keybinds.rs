@@ -4,6 +4,8 @@ const ESC: u8 = 0x1B;
 pub enum Action {
     SwitchTab(usize),
     Detach,
+    ScrollPageUp,
+    ScrollPageDown,
 }
 
 pub struct Keybinds {
@@ -19,6 +21,9 @@ impl Keybinds {
             bindings.push((vec![ESC, b'0' + digit], Action::SwitchTab(digit as usize)));
         }
         bindings.push((vec![ESC, b'd'], Action::Detach));
+        // Shift+PageUp / Shift+PageDown
+        bindings.push((vec![ESC, b'[', b'5', b';', b'2', b'~'], Action::ScrollPageUp));
+        bindings.push((vec![ESC, b'[', b'6', b';', b'2', b'~'], Action::ScrollPageDown));
         let max_len = bindings.iter().map(|(seq, _)| seq.len()).max().unwrap_or(0);
         Self { bindings, pending: Vec::new(), max_len }
     }

@@ -1,6 +1,6 @@
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::{Config, LineDamageBounds, Term, TermDamage, TermMode};
 use alacritty_terminal::term::cell::Flags;
@@ -52,7 +52,8 @@ pub struct Pane {
 impl Pane {
     pub fn new(pty: Pty, rows: u16, cols: u16) -> Self {
         let size = TermSize { rows: rows as usize, cols: cols as usize };
-        let config = Config::default();
+        let mut config = Config::default();
+        config.scrolling_history = 5000;
         let proxy = PtyEventProxy { master_raw: pty.master_fd().as_raw_fd() };
         let term = Term::new(config, &size, proxy);
         let processor = Processor::new();
@@ -76,6 +77,18 @@ impl Pane {
         *self.term.mode()
     }
 
+    pub fn scroll(&mut self, scroll: Scroll) {
+        self.term.scroll_display(scroll);
+    }
+
+    pub fn display_offset(&self) -> usize {
+        self.term.grid().display_offset()
+    }
+
+    pub fn reset_damage(&mut self) {
+        self.term.reset_damage();
+    }
+
     /// Resize both the virtual terminal and the underlying PTY.
     pub fn resize(&mut self, rows: u16, cols: u16) {
         let size = TermSize { rows: rows as usize, cols: cols as usize };
@@ -94,6 +107,7 @@ impl Pane {
         let content = self.term.renderable_content();
         let rows = self.term.screen_lines();
         let cols = self.term.columns();
+        let offset = content.display_offset as i32;
 
         let mut buf = Vec::with_capacity(rows * cols);
 
@@ -101,12 +115,13 @@ impl Pane {
         buf.extend_from_slice(b"\x1B[0m\x1B[2J\x1B[H");
 
         let mut sgr = SgrState::new();
-        let mut cur_line: i32 = 0;
+        let mut cur_row: i32 = 0;
         let mut cur_col: usize = 0;
 
         for indexed in content.display_iter {
             let point = indexed.point;
             let cell = indexed.cell;
+            let screen_row = point.line.0 + offset;
 
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                 continue;
@@ -122,15 +137,15 @@ impl Pane {
             }
 
             // Position cursor if not at expected position.
-            if point.line.0 != cur_line || point.column.0 != cur_col {
+            if screen_row != cur_row || point.column.0 != cur_col {
                 buf.extend_from_slice(
-                    format!("\x1B[{};{}H", point.line.0 + 1, point.column.0 + 1).as_bytes()
+                    format!("\x1B[{};{}H", screen_row + 1, point.column.0 + 1).as_bytes()
                 );
             }
 
             write_cell(&mut buf, cell.c, cell.flags, cell.fg, cell.bg, &mut sgr);
 
-            cur_line = point.line.0;
+            cur_row = screen_row;
             cur_col = point.column.0 + 1;
             if cell.flags.contains(Flags::WIDE_CHAR) {
                 cur_col += 1;
@@ -140,14 +155,20 @@ impl Pane {
         buf.extend_from_slice(b"\x1B[0m");
 
         let cursor = content.cursor;
-        buf.extend_from_slice(
-            format!("\x1B[{};{}H", cursor.point.line.0 + 1, cursor.point.column.0 + 1).as_bytes()
-        );
-        if cursor.shape == CursorShape::Hidden {
-            buf.extend_from_slice(b"\x1B[?25l");
+        let cursor_row = cursor.point.line.0 + offset;
+        if cursor_row >= 0 && cursor_row < rows as i32 {
+            buf.extend_from_slice(
+                format!("\x1B[{};{}H", cursor_row + 1, cursor.point.column.0 + 1).as_bytes()
+            );
+            if cursor.shape == CursorShape::Hidden {
+                buf.extend_from_slice(b"\x1B[?25l");
+            } else {
+                buf.extend_from_slice(b"\x1B[?25h");
+                write_cursor_shape(&mut buf, self.term.cursor_style());
+            }
         } else {
-            buf.extend_from_slice(b"\x1B[?25h");
-            write_cursor_shape(&mut buf, self.term.cursor_style());
+            // Cursor not in viewport (scrolled away), hide it.
+            buf.extend_from_slice(b"\x1B[?25l");
         }
 
         buf
@@ -171,6 +192,82 @@ impl Pane {
                 let buf = self.render_damaged(&lines);
                 (buf, false)
             }
+        }
+    }
+
+    /// Incrementally render a scroll by shifting existing content and
+    /// only drawing the newly revealed lines. Falls back to full render
+    /// if the delta exceeds the screen height.
+    pub fn render_scroll(&mut self, old_offset: usize, new_offset: usize) -> Vec<u8> {
+        let rows = self.term.screen_lines();
+        let cols = self.term.columns();
+        let delta = new_offset as i32 - old_offset as i32;
+        let abs_delta = delta.unsigned_abs() as usize;
+
+        self.term.reset_damage();
+
+        if abs_delta >= rows {
+            return self.render();
+        }
+
+        let grid = self.term.grid();
+        let display_offset = new_offset as i32;
+        let mut buf = Vec::new();
+
+        if delta > 0 {
+            // Scrolling up: content shifts down, new lines at top.
+            buf.extend_from_slice(format!("\x1B[{}T", abs_delta).as_bytes());
+            for screen_row in 0..abs_delta {
+                self.render_row(&mut buf, grid, screen_row, display_offset, cols);
+            }
+        } else {
+            // Scrolling down: content shifts up, new lines at bottom.
+            buf.extend_from_slice(format!("\x1B[{}S", abs_delta).as_bytes());
+            for screen_row in (rows - abs_delta)..rows {
+                self.render_row(&mut buf, grid, screen_row, display_offset, cols);
+            }
+        }
+
+        buf.extend_from_slice(b"\x1B[0m");
+
+        // Cursor: hidden when scrolled, shown when back at bottom.
+        if new_offset > 0 {
+            buf.extend_from_slice(b"\x1B[?25l");
+        } else {
+            let cursor = grid.cursor.point;
+            buf.extend_from_slice(
+                format!("\x1B[{};{}H", cursor.line.0 + 1, cursor.column.0 + 1).as_bytes()
+            );
+            if self.term.mode().contains(TermMode::SHOW_CURSOR) {
+                buf.extend_from_slice(b"\x1B[?25h");
+                write_cursor_shape(&mut buf, self.term.cursor_style());
+            } else {
+                buf.extend_from_slice(b"\x1B[?25l");
+            }
+        }
+
+        buf
+    }
+
+    fn render_row(
+        &self,
+        buf: &mut Vec<u8>,
+        grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
+        screen_row: usize,
+        display_offset: i32,
+        cols: usize,
+    ) {
+        let grid_line = Line(screen_row as i32 - display_offset);
+        buf.extend_from_slice(
+            format!("\x1B[{};1H\x1B[2K\x1B[0m", screen_row + 1).as_bytes()
+        );
+        let mut sgr = SgrState::new();
+        for col in 0..cols {
+            let cell = &grid[grid_line][Column(col)];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            write_cell(buf, cell.c, cell.flags, cell.fg, cell.bg, &mut sgr);
         }
     }
 

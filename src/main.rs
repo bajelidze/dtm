@@ -90,14 +90,14 @@ fn run_client(socket_path: &std::path::Path, session_name: &str) -> io::Result<(
 
     let orig_termios = enter_raw_mode(stdin.as_fd());
 
-    // Enter alternate screen buffer and clear it.
-    let _ = nix::unistd::write(stdout.as_fd(), b"\x1B[?1049h\x1B[2J\x1B[H");
+    // Enter alternate screen buffer, clear it, enable mouse tracking (SGR mode).
+    let _ = nix::unistd::write(stdout.as_fd(), b"\x1B[?1049h\x1B[2J\x1B[H\x1B[?1000h\x1B[?1006h");
 
     let mut client = client::Client::connect(socket_path)?;
     let result = client.run(stdin.as_fd(), stdout.as_fd());
 
-    // Leave alternate screen buffer and show cursor.
-    let _ = nix::unistd::write(stdout.as_fd(), b"\x1B[?1049l\x1B[?25h");
+    // Disable mouse tracking, leave alternate screen buffer, show cursor.
+    let _ = nix::unistd::write(stdout.as_fd(), b"\x1B[?1006l\x1B[?1000l\x1B[?1049l\x1B[?25h");
     let _ = termios::tcsetattr(stdin.as_fd(), termios::SetArg::TCSANOW, &orig_termios);
 
     match result {
