@@ -9,23 +9,23 @@ pub struct SessionInfo {
 }
 
 /// Determine the socket directory using the platform fallback chain:
-/// 1. $DTM_TMPDIR
-/// 2. $XDG_RUNTIME_DIR/dtm/
-/// 3. $TMPDIR/dtm-{uid}/
-/// 4. /tmp/dtm-{uid}/
+/// 1. $WYND_TMPDIR
+/// 2. $XDG_RUNTIME_DIR/wynd/
+/// 3. $TMPDIR/wynd-{uid}/
+/// 4. /tmp/wynd-{uid}/
 ///
 /// Creates the directory (mode 0700) if it does not exist.
 pub fn socket_dir() -> PathBuf {
-    let dir = if let Ok(d) = std::env::var("DTM_TMPDIR") {
+    let dir = if let Ok(d) = std::env::var("WYND_TMPDIR") {
         PathBuf::from(d)
     } else if let Ok(d) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(d).join("dtm")
+        PathBuf::from(d).join("wynd")
     } else {
         let uid = nix::unistd::getuid();
         if let Ok(d) = std::env::var("TMPDIR") {
-            PathBuf::from(d).join(format!("dtm-{}", uid))
+            PathBuf::from(d).join(format!("wynd-{}", uid))
         } else {
-            PathBuf::from(format!("/tmp/dtm-{}", uid))
+            PathBuf::from(format!("/tmp/wynd-{}", uid))
         }
     };
 

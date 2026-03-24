@@ -88,8 +88,8 @@ pub fn start_server(socket_path: &Path, session_name: &str, shell: &CString) -> 
             // Write PID file.
             crate::session::write_pid(session_name, std::process::id());
 
-            // Set DTM env to prevent nesting.
-            unsafe { std::env::set_var("DTM", "1"); }
+            // Set WYND env to prevent nesting.
+            unsafe { std::env::set_var("WYND", "1"); }
 
             // Create initial PTY and Mux.
             // Use a default size; the client will send Resize immediately.

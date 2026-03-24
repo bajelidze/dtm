@@ -73,8 +73,8 @@ pub fn resolve_shell() -> std::ffi::CString {
 
 /// Run as a client: raw mode, alternate screen, connect to server, forward I/O.
 fn run_client(socket_path: &std::path::Path, session_name: &str) -> io::Result<()> {
-    if std::env::var_os("DTM").is_some() {
-        eprintln!("dtm sessions cannot be nested");
+    if std::env::var_os("WYND").is_some() {
+        eprintln!("wynd sessions cannot be nested");
         std::process::exit(1);
     }
 

@@ -157,7 +157,11 @@ impl Mux {
             }
         }
 
-        buf.extend_from_slice(&layout::render_separators(&separators));
+        let focused_region = regions.iter().find(|(id, _)| *id == tab.focused).map(|(_, r)| *r);
+        let focused_idx = tab.pane_ids.iter().position(|&id| id == tab.focused).unwrap_or(0);
+        buf.extend_from_slice(&layout::render_separators(
+            &separators, tab.pane_ids.len(), focused_idx, focused_region,
+        ));
 
         // Cursor for focused pane.
         if let Some(&(_, region)) = regions.iter().find(|(id, _)| *id == tab.focused) {
@@ -276,6 +280,20 @@ impl Mux {
         out.extend_from_slice(b"\x1B[?25l");
 
         let regions = self.active_regions();
+
+        // Re-render separators to update the focus highlight.
+        if let Some(tab) = self.tabs.get(&self.active) {
+            if tab.pane_ids.len() > 1 {
+                let area = self.pane_area();
+                let seps = layout::master_stack_separators(tab.pane_ids.len(), area, MASTER_RATIO);
+                let focused_idx = tab.pane_ids.iter().position(|&id| id == target).unwrap_or(0);
+                let focused_region = regions.iter().find(|(id, _)| *id == target).map(|(_, r)| *r);
+                out.extend_from_slice(&layout::render_separators(
+                    &seps, tab.pane_ids.len(), focused_idx, focused_region,
+                ));
+            }
+        }
+
         if let Some(&(_, region)) = regions.iter().find(|(id, _)| *id == target) {
             if let Some(pane) = self.panes.get(&target) {
                 out.extend_from_slice(&pane.cursor_at(region.row, region.col));

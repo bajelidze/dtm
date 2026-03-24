@@ -1,13 +1,13 @@
 pub enum Command {
     /// No arguments: create new session or attach to last.
     Default,
-    /// dtm new [-s name]
+    /// wynd new [-s name]
     New { name: Option<String> },
-    /// dtm attach [-t name]
+    /// wynd attach [-t name]
     Attach { target: Option<String> },
-    /// dtm ls
+    /// wynd ls
     List,
-    /// dtm kill [-t name]
+    /// wynd kill [-t name]
     Kill { target: Option<String> },
 }
 
@@ -34,7 +34,7 @@ pub fn parse_args() -> Command {
         }
         _ => {
             eprintln!("unknown command: {}", args[0]);
-            eprintln!("usage: dtm [new [-s name] | attach [-t name] | ls | kill [-t name]]");
+            eprintln!("usage: wynd [new [-s name] | attach [-t name] | ls | kill [-t name]]");
             std::process::exit(1);
         }
     }
