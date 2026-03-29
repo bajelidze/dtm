@@ -2,28 +2,31 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
+const UNIX_SOCKET_FILE_EXT: &str = "sock";
+const PID_FILE_EXT: &str = "pid";
+
 /// Information about a discovered session.
 pub struct SessionInfo {
     pub name: String,
     pub alive: bool,
 }
 
-/// Determine the socket directory using the platform fallback chain:
+/// Determine the session directory using the platform fallback chain:
 /// 1. $WYND_TMPDIR
 /// 2. $XDG_RUNTIME_DIR/wynd/
 /// 3. $TMPDIR/wynd-{uid}/
 /// 4. /tmp/wynd-{uid}/
 ///
 /// Creates the directory (mode 0700) if it does not exist.
-pub fn socket_dir() -> PathBuf {
-    let dir = if let Ok(d) = std::env::var("WYND_TMPDIR") {
-        PathBuf::from(d)
-    } else if let Ok(d) = std::env::var("XDG_RUNTIME_DIR") {
-        PathBuf::from(d).join("wynd")
+pub fn session_dir() -> PathBuf {
+    let dir = if let Ok(tmp_dir) = std::env::var("WYND_TMPDIR") {
+        PathBuf::from(tmp_dir)
+    } else if let Ok(tmp_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        PathBuf::from(tmp_dir).join("wynd")
     } else {
         let uid = nix::unistd::getuid();
-        if let Ok(d) = std::env::var("TMPDIR") {
-            PathBuf::from(d).join(format!("wynd-{}", uid))
+        if let Ok(tmp_dir) = std::env::var("TMPDIR") {
+            PathBuf::from(tmp_dir).join(format!("wynd-{}", uid))
         } else {
             PathBuf::from(format!("/tmp/wynd-{}", uid))
         }
@@ -39,14 +42,14 @@ pub fn socket_dir() -> PathBuf {
 
 /// Return the socket path for a named session.
 pub fn socket_path(name: &str) -> PathBuf {
-    socket_dir().join(format!("{}.sock", name))
+    session_dir().join(format!("{}.{}", name, UNIX_SOCKET_FILE_EXT))
 }
 
 /// List all sessions by scanning the socket directory.
 /// Checks liveness via the PID file (kill(pid, 0)) to avoid connecting
 /// to the socket, which would disrupt the active client.
 pub fn list_sessions() -> Vec<SessionInfo> {
-    let dir = socket_dir();
+    let dir = session_dir();
     let mut sessions = Vec::new();
 
     let entries = match fs::read_dir(&dir) {
@@ -56,7 +59,7 @@ pub fn list_sessions() -> Vec<SessionInfo> {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("sock") {
+        if !is_unix_socket_path(&path) {
             continue;
         }
         let name = match path.file_stem().and_then(|s| s.to_str()) {
@@ -81,15 +84,20 @@ fn is_alive(name: &str) -> bool {
     }
 }
 
+/// Return true if the passed path is a Unix socket path.
+fn is_unix_socket_path(path: &PathBuf) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some(UNIX_SOCKET_FILE_EXT)
+}
+
 /// Generate a default session name (sequential integer).
 pub fn generate_name() -> String {
-    let dir = socket_dir();
+    let dir = session_dir();
     let mut max: i64 = -1;
 
     if let Ok(entries) = fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("sock") {
+            if path.extension().and_then(|e| e.to_str()) != Some(UNIX_SOCKET_FILE_EXT) {
                 continue;
             }
             if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
@@ -113,7 +121,7 @@ pub fn cleanup_stale(name: &str) {
 
 /// Return the PID file path for a named session.
 pub fn pid_path(name: &str) -> PathBuf {
-    socket_dir().join(format!("{}.pid", name))
+    session_dir().join(format!("{}.{}", name, PID_FILE_EXT))
 }
 
 /// Write the server PID to the PID file.
